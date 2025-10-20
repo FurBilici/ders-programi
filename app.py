@@ -10,10 +10,11 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_pdf import PdfPages
 
-st.set_page_config(page_title="Ders Programı", layout="wide")
-STATE_FILE = "timetable_state.json"
+st.set_page_config(page_title="Ders Programı (Greedy + PDF/Excel + Pin + Kıtlık-Önce + JSON İndir/Yükle)", layout="wide")
 
 # ====================== Yardımcılar ======================
+
+APP_STATE_VERSION = 2  # JSON şemasına basit sürüm etiketi
 
 def default_constraint_settings():
     return {
@@ -62,14 +63,21 @@ def _to_bool(v):
     s = str(v).strip().lower()
     return s in ["true","1","evet","yes","y","t","e","doğru","on"]
 
-def save_state():
-    data = {
+# --- JSON İndir/Yükle (Kullanıcı tarafı kalıcılık) ---
+
+def build_state_payload() -> dict:
+    """Şu anki durumu JSON'a uygun bir dict olarak çıkar."""
+    return {
+        "_version": APP_STATE_VERSION,
         "days": st.session_state.days,
         "slots_per_day": st.session_state.slots_per_day,
         "time_labels": st.session_state.time_labels,
         "rooms": st.session_state.rooms,
         "instructors": st.session_state.instructors,
-        "instructor_unavailable": {k: list(v) for k, v in st.session_state.instructor_unavailable.items()},
+        "instructor_unavailable": {
+            k: [[int(d), int(s)] for (d, s) in v]
+            for k, v in st.session_state.instructor_unavailable.items()
+        },
         "courses": st.session_state.courses,
         "constraint_settings": st.session_state.constraint_settings,
         "day_start_slot": st.session_state.day_start_slot,
@@ -77,27 +85,46 @@ def save_state():
         "pins": st.session_state.pins,
         "strategy": st.session_state.strategy,
     }
-    with open(STATE_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
 
-def load_state():
-    if not os.path.exists(STATE_FILE): return False
-    with open(STATE_FILE, "r", encoding="utf-8") as f:
-        data = json.load(f)
-    st.session_state.days = data["days"]
-    st.session_state.slots_per_day = int(data["slots_per_day"])
-    st.session_state.time_labels = {int(k): v for k, v in data["time_labels"].items()}
-    st.session_state.rooms = data["rooms"]
-    st.session_state.instructors = data["instructors"]
-    st.session_state.instructor_unavailable = {k: set(map(tuple, v)) for k, v in data["instructor_unavailable"].items()}
-    st.session_state.courses = data["courses"]
+def apply_state_payload(data: dict):
+    """JSON'dan alınan dict'i session'a uygula (tip dönüşümleri dahil)."""
+    # Zorunlu alanlar için varsayılanlar
+    days = data.get("days", ["Pzt","Sal","Çar","Per","Cum"])
+    spd = int(data.get("slots_per_day", 10))
+    st.session_state.days = [str(d) for d in days]
+    st.session_state.slots_per_day = spd
+    st.session_state.time_labels = {int(k): str(v) for k, v in data.get("time_labels", {}).items()} or {
+        i: f"{9+i:02d}:00" for i in range(spd)
+    }
+    st.session_state.rooms = list(data.get("rooms", [{"id":"Oda-1"},{"id":"Oda-2"}]))
+    st.session_state.instructors = list(data.get("instructors", []))
+    # Hoca uygunlukları set(tuple) olarak geri yükle
+    iu = {}
+    for h, slots in data.get("instructor_unavailable", {}).items():
+        try:
+            iu[h] = set((int(d), int(s)) for d, s in slots)
+        except Exception:
+            iu[h] = set()
+    st.session_state.instructor_unavailable = iu
+    # Kurslar
+    st.session_state.courses = []
+    for c in data.get("courses", []):
+        st.session_state.courses.append({
+            "id": str(c.get("id","")).strip(),
+            "ad": str(c.get("ad","")).strip(),
+            "hoca": str(c.get("hoca","")).strip(),
+            "sinif": int(c.get("sinif",1)),
+            "sure": int(c.get("sure",1)),
+            "ardisik": bool(c.get("ardisik", False)),
+            "online": bool(c.get("online", False)),
+        })
+    # Kısıtlar & gün penceresi & pinler
     st.session_state.constraint_settings = data.get("constraint_settings", default_constraint_settings())
     dcount = len(st.session_state.days)
     st.session_state.day_start_slot = {int(k): int(v) for k, v in data.get("day_start_slot", {i:0 for i in range(dcount)}).items()}
-    st.session_state.day_use_slots  = {int(k): int(v) for k, v in data.get("day_use_slots",  {i:st.session_state.slots_per_day for i in range(dcount)}).items()}
-    st.session_state.pins = data.get("pins", [])
-    st.session_state.strategy = data.get("strategy", "Kıtlık-önce (önerilir)")
-    return True
+    st.session_state.day_use_slots  = {int(k): int(v) for k, v in data.get("day_use_slots",  {i:spd for i in range(dcount)}).items()}
+    st.session_state.pins = list(data.get("pins", []))
+    st.session_state.strategy = str(data.get("strategy", "Kıtlık-önce (önerilir)"))
 
 def export_courses_csv(courses):
     out = io.StringIO()
@@ -149,14 +176,13 @@ def greedy_schedule(days, spd, rooms, courses, inst_unav, cs, day_start_slot, da
     busy_class = [[set() for _ in range(spd)] for __ in range(n_days)]
 
     placed, unplaced = [], []
-
     idx_by_id = {c["id"]: i for i, c in enumerate(courses)}
 
     # ---- 1) PIN'ler ----
     pinned_ci = set()
     for p in pins:
         cid = p.get("id", "").strip()
-        if cid not in idx_by_id:  # bilinmeyen ders
+        if cid not in idx_by_id:
             continue
         ci = idx_by_id[cid]
         if ci in pinned_ci:
@@ -385,11 +411,9 @@ def _wrap_cell(text, max_chars):
     if text is None: return ""
     t = str(text).strip()
     if t == "-" or t == "": return ""
-    # Var olan "/" ayraçlarını satır kır, sonra her satırı sar
     t = t.replace(" / ", "\n")
     lines = []
     for part in t.split("\n"):
-        # boşsa koru
         if not part.strip():
             lines.append("")
             continue
@@ -399,20 +423,14 @@ def _wrap_cell(text, max_chars):
 
 def timetable_to_pdf(timetable_df, days, rooms, time_labels, pdf_path):
     max_slot_index = max(time_labels.keys()) if time_labels else 0
-    # Sütun genişlik oranları: Saat dar, diğerleri eşit
-    n_content = len(rooms) + 1  # rooms + ONLINE
-    # toplam 1.0: Saat=0.12, kalan eşit pay
+    n_content = len(rooms) + 1
     saat_w = 0.12
     rest_w = (1.0 - saat_w) / n_content
     col_widths = [saat_w] + [rest_w]*(n_content)
-
-    # Kolona göre karakter limiti (yaklaşık hesap): genişlik*100 karakter
-    # (dpi/font etkileri nedeniyle yaklaşık, ama pratikte iyi sonuç verir)
     col_char_limits = [8] + [max(16, int(rest_w*100))]*n_content
 
     with PdfPages(pdf_path) as pdf:
         for d in days:
-            # Gün DataFrame'i
             cols = ["Saat"] + [r["id"] for r in rooms] + ["ONLINE"]
             rows = []
             for s in range(max_slot_index + 1):
@@ -441,7 +459,7 @@ def timetable_to_pdf(timetable_df, days, rooms, time_labels, pdf_path):
 
             df = pd.DataFrame(rows, columns=cols)
 
-            # Wrap uygulanmış hücre matrisini hazırla ve satır başına max satır sayısını ölç
+            # Wrap ve satır yükseklikleri
             wrapped = []
             row_max_lines = []
             for r_i in range(len(df)):
@@ -455,7 +473,6 @@ def timetable_to_pdf(timetable_df, days, rooms, time_labels, pdf_path):
                 wrapped.append(wr_row)
                 row_max_lines.append(max_lines)
 
-            # Şekil
             fig = plt.figure(figsize=(11.69, 8.27))  # A4 yatay
             ax = plt.gca()
             ax.axis('off')
@@ -463,23 +480,19 @@ def timetable_to_pdf(timetable_df, days, rooms, time_labels, pdf_path):
 
             tbl = ax.table(cellText=wrapped, colLabels=df.columns, loc='center', cellLoc='left')
             tbl.auto_set_font_size(False)
-            tbl.set_fontsize(7)  # daha küçük font
+            tbl.set_fontsize(7)
 
-            # Sütun genişliklerini uygula (tüm hücreler)
             for (r, c), cell in tbl.get_celld().items():
-                # header = r == 0
                 w = col_widths[c] if c < len(col_widths) else rest_w
                 cell.set_width(w)
 
-            # Satır yüksekliklerini max satır sayısına göre ayarla
-            base_h = 0.04  # temel yükseklik
-            for r in range(1, len(df)+1):  # 1..n (0 header)
+            base_h = 0.04
+            for r in range(1, len(df)+1):  # 1..n, 0 header
                 lines = row_max_lines[r-1]
                 h = base_h * max(1.0, lines*0.9)
                 for c in range(len(cols)):
                     tbl[(r, c)].set_height(h)
 
-            # Header stil
             for c in range(len(cols)):
                 hdr = tbl[(0, c)]
                 hdr.set_height(0.05)
@@ -491,14 +504,11 @@ def timetable_to_pdf(timetable_df, days, rooms, time_labels, pdf_path):
 # ====================== Excel Üretimi (gün başına ayrı sayfa) ======================
 
 def timetable_to_excel_bytes(timetable_df, days, rooms, time_labels):
-    from openpyxl.utils.dataframe import dataframe_to_rows
     from openpyxl import Workbook
     from openpyxl.styles import Alignment, Font
 
     wb = Workbook()
-    # Varsayılan ilk sayfayı kaldır
     wb.remove(wb.active)
-
     max_slot_index = max(time_labels.keys()) if time_labels else 0
     room_ids = [r["id"] for r in rooms]
 
@@ -506,14 +516,12 @@ def timetable_to_excel_bytes(timetable_df, days, rooms, time_labels):
         ws = wb.create_sheet(title=d)
         headers = ["Saat"] + room_ids + ["ONLINE"]
         ws.append(headers)
-        # Bold header
         for col in range(1, len(headers)+1):
             ws.cell(row=1, column=col).font = Font(bold=True)
 
         for s in range(max_slot_index + 1):
             saat = time_labels.get(s, f"{s+1}. Slot")
             row_vals = [saat]
-            # Odalar
             for rid in room_ids:
                 mask = (
                     (timetable_df["Day"] == d) &
@@ -524,7 +532,6 @@ def timetable_to_excel_bytes(timetable_df, days, rooms, time_labels):
                 vals = timetable_df.loc[mask, "Courses"].values
                 v = "" if len(vals)==0 or str(vals[0]).strip()=="-" else str(vals[0]).replace(" / ", "\n")
                 row_vals.append(v)
-            # ONLINE
             mask_on = (
                 (timetable_df["Day"] == d) &
                 (timetable_df["Slot"] == saat) &
@@ -536,18 +543,14 @@ def timetable_to_excel_bytes(timetable_df, days, rooms, time_labels):
             row_vals.append(v_on)
             ws.append(row_vals)
 
-        # Sar/ortala ve kolon genişlikleri
         wrap = Alignment(wrap_text=True, vertical="top")
         for r in ws.iter_rows(min_row=2, max_row=ws.max_row, min_col=1, max_col=ws.max_column):
             for cell in r:
                 cell.alignment = wrap
 
-        # Kolon genişlikleri (yaklaşık): Saat dar, diğerleri geniş
         ws.column_dimensions["A"].width = 10
         for idx in range(2, len(headers)+1):
-            ws.column_dimensions[chr(64+idx)].width = 45  # B.. son
-
-        # Satır yüksekliğini biraz artır (dolguya göre Excel kendisi de büyütür)
+            ws.column_dimensions[chr(64+idx)].width = 45
         for rr in range(2, ws.max_row+1):
             ws.row_dimensions[rr].height = 30
 
@@ -566,18 +569,22 @@ left, right = st.columns([0.48, 0.52])
 with left:
     st.header("Veri Girişi")
 
-    colA, colB = st.columns(2)
-    with colA:
-        if st.button("💾 Kaydet (JSON)"):
-            save_state()
-            st.success("Durum kaydedildi.")
-    with colB:
-        if st.button("📂 Yükle (JSON)"):
-            if load_state():
-                st.success("Kayıtlı durum yüklendi.")
+    # ---- JSON İndir / JSON Yükle (Cloud kalıcılığı için önerilen) ----
+    with st.expander("💾 JSON İndir / 📂 JSON Yükle (Kalıcı kayıt için önerilir)", expanded=True):
+        # İndir
+        state_bytes = json.dumps(build_state_payload(), ensure_ascii=False, indent=2).encode("utf-8")
+        st.download_button("💾 JSON indir", data=state_bytes, file_name="timetable_state.json", mime="application/json")
+
+        # Yükle
+        up = st.file_uploader("JSON yükle ve uygula", type=["json"])
+        if up is not None and st.button("JSON'u Uygula"):
+            try:
+                data = json.load(up)
+                apply_state_payload(data)
+                st.success("JSON uygulandı. Arayüz güncellendi.")
                 st.rerun()
-            else:
-                st.warning("Kayıt dosyası bulunamadı.")
+            except Exception as e:
+                st.error(f"JSON okunamadı: {e}")
 
     with st.expander("📥 Dersleri İçe/Dışa Aktar", expanded=False):
         template_cols = ["id","ad","hoca","sinif","sure","ardisik","online"]
@@ -603,10 +610,10 @@ with left:
                                file_name="dersler.xlsx",
                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
-        uploaded = st.file_uploader("Excel (.xlsx) veya CSV yükle", type=["xlsx","csv"])
+        uploaded = st.file_uploader("Excel (.xlsx) veya CSV yükle", type=["xlsx","csv"], key="course_upload")
         replace_all = st.checkbox("Mevcut listeyi SİL (tam yerine yaz)", value=False)
         update_existing = st.checkbox("Aynı ID'li dersi güncelle", value=True)
-        if st.button("İçe Aktar"):
+        if st.button("İçe Aktar", key="import_courses"):
             if not uploaded:
                 st.warning("Önce bir dosya yükleyin.")
             else:
@@ -831,7 +838,7 @@ with left:
                     st.rerun()
 
 with right:
-    st.header("Gün Gün Planlama")
+    st.header("Gün Gün Greedy Planlama")
 
     with st.expander("⚙️ Kısıt Ayarları ve Strateji", expanded=True):
         cs = st.session_state.constraint_settings
@@ -858,7 +865,7 @@ with right:
             }
             st.success("Kaydedildi.")
 
-    if st.button("📅 GÜN GÜN PLANLA"):
+    if st.button("📅 GÜN GÜN PLANLA (Greedy)"):
         days = st.session_state.days
         spd = st.session_state.slots_per_day
         rooms = st.session_state.rooms
@@ -891,7 +898,7 @@ with right:
         st.download_button("Programı CSV indir", data=out.getvalue(),
                            file_name="timetable.csv", mime="text/csv")
 
-        # Excel indir (gün sayfası bazlı)
+        # Excel indir
         excel_bytes = timetable_to_excel_bytes(
             timetable_df,
             days=st.session_state.days,
@@ -902,7 +909,7 @@ with right:
                            file_name="timetable.xlsx",
                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
-        # PDF indir (wrap + dinamik satır)
+        # PDF indir
         pdf_path = "timetable.pdf"
         timetable_to_pdf(
             timetable_df,
@@ -927,4 +934,4 @@ with right:
                                file_name="unscheduled_diagnostics.csv", mime="text/csv")
 
     st.markdown("---")
-    st.caption("PDF'de taşma olmaması için metinler sütun genişliğine göre sarılır; satır yükseklikleri dinamik ayarlanır. Excel'de her gün ayrı sayfada wrap açık gelir.")
+    st.caption("Streamlit Cloud'da kalıcı depolama olmadığı için 'JSON indir / JSON yükle' akışı ile verileri saklayın.")
